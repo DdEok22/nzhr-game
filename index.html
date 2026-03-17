@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Net-Zero Home Race</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:#8DB580;overflow-x:hidden}
+::-webkit-scrollbar{width:4px}::-webkit-scrollbar-thumb{background:rgba(59,47,47,.2);border-radius:4px}
+@keyframes ds{0%,100%{transform:rotate(0)}25%{transform:rotate(-18deg) scale(1.1)}75%{transform:rotate(18deg) scale(1.1)}}
+@keyframes fi{from{opacity:0}to{opacity:1}}
+@keyframes su{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+@keyframes si{from{opacity:0;transform:scale(.9)}to{opacity:1;transform:scale(1)}}
+@keyframes fl{0%,100%{transform:translateY(0)}50%{transform:translateY(-12px)}}
+@keyframes pp{0%,100%{box-shadow:0 0 0 0 rgba(212,168,67,.5)}50%{box-shadow:0 0 0 8px rgba(212,168,67,0)}}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/ort.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+
+<script type="text/babel">
+const {useState,useEffect,useRef,useCallback,useReducer}=React;
+
+/* ============================================================
+   CONFIG
+   ============================================================ */
+const GOOGLE_SHEETS_URL = ""; // ← Paste your Google Apps Script URL
+const ONNX_MODEL_PATH = "nzhr_policy.onnx"; // ← Place alongside this HTML
+
+/* ============================================================
+   ONNX PPO MODEL INTEGRATION
+   ============================================================ */
+
+// Retrofit order MUST match RL_Environment.py RETROFIT_NAMES
+const RL_RETROFIT_ORDER = [
+  "LED Lights","Electric Water Heater","A/C Tune-Up","Heat Pump",
+  "Wall Insulation","Ceiling Insulation","Radiant Barrier","Cool Roof",
+  "Window Replacement","Window Screen","Ceiling Fan","Washer Replacement",
+  "Cooktop Replacement","Dryer Replacement","Air Sealing","Solar PV"
+];
+
+// Map abbreviated game names → RL env full names
+const NAME_MAP = {
+  "Elec. Water Heater":"Electric Water Heater","Cooktop Replace":"Cooktop Replacement",
+  "Window Replace":"Window Replacement","Dryer Replace":"Dryer Replacement",
+  "Ceiling Insul.":"Ceiling Insulation","Washer Replace":"Washer Replacement",
+  "Wall Insul.":"Wall Insulation","LED Lights":"LED Lights","Heat Pump":"Heat Pump",
+  "Radiant Barrier":"Radiant Barrier","Cool Roof":"Cool Roof","Window Screen":"Window Screen",
+  "Ceiling Fan":"Ceiling Fan","Air Sealing":"Air Sealing","A/C Tune-Up":"A/C Tune-Up",
+  "Solar PV":"Solar PV",
+};
+
+let onnxSession = null;
+let onnxLoaded = false;
+
+async function loadONNX() {
+  try {
+    // Try loading from same directory
+    onnxSession = await ort.InferenceSession.create(ONNX_MODEL_PATH);
+    onnxLoaded = true;
+    console.log("✅ PPO ONNX model loaded!");
+    return true;
+  } catch (e) {
+    console.log("⚠️ ONNX model not found, using heuristic AI.", e.message);
+    onnxLoaded = false;
+    return false;
+  }
+}
+
+// Construct 48-dim state vector matching RL_Environment._get_observation()
+function buildStateVector(gameSt, space) {
+  const obs = new Float32Array(48);
+  
+  // [0-3] Basic: year/20, position/23, capital/50000, totalSavings/50000
+  obs[0] = gameSt.year / 20.0;
+  obs[1] = gameSt.pos / 23.0;
+  obs[2] = gameSt.capital / 50000.0;
+  obs[3] = gameSt.ts / 50000.0;  // annual_energy_savings approx
+  
+  // [4-19] has_retrofit (16 binary flags)
+  // [20-35] years_remaining / 30
+  const ownedMap = {};
+  gameSt.ar.forEach(r => { ownedMap[NAME_MAP[r.name] || r.name] = r; });
+  
+  for (let i = 0; i < 16; i++) {
+    const rlName = RL_RETROFIT_ORDER[i];
+    if (ownedMap[rlName]) {
+      obs[4 + i] = 1.0;
+      obs[20 + i] = ownedMap[rlName].yr / 30.0;
+    }
+  }
+  
+  // [36] is_retrofit
+  obs[36] = space.t === "retrofit" ? 1.0 : 0.0;
+  
+  // [37] can_afford: min(capital/cost, 1.0)
+  const cost = space.c || 1;
+  obs[37] = Math.min(gameSt.capital / cost, 1.0);
+  
+  // [38] previous_savings / 50000
+  obs[38] = gameSt.ts / 50000.0;
+  
+  // [39-41] weather one-hot: none=39, heat=40, cold=41
+  obs[39] = 1.0; // default: none
+  
+  // [42-47] ob one-hot: none=42
+  obs[42] = 1.0; // default: none
+  
+  return obs;
+}
+
+// Run PPO inference
+async function runPPO(gameSt, space) {
+  if (!onnxLoaded || !onnxSession) return null;
+  
+  try {
+    const stateVec = buildStateVector(gameSt, space);
+    const tensor = new ort.Tensor('float32', stateVec, [1, 48]);
+    const results = await onnxSession.run({ observation: tensor });
+    const probs = results.action_probs.data; // [P(skip), P(buy)]
+    
+    return {
+      pSkip: probs[0],
+      pBuy: probs[1],
+      rec: probs[1] > 0.5,
+      confidence: Math.max(probs[0], probs[1]),
+      source: "ppo"
+    };
+  } catch (e) {
+    console.error("PPO inference error:", e);
+    return null;
+  }
+}
+
+// Initialize ONNX on page load
+loadONNX();
+
+/* ============================================================
+   GAME DATA (unchanged from previous version)
+   ============================================================ */
+const SIM_YRS=20,BASE_CAP=8000,BASE_E=48000,RATE=0.12;
+const LIFE={"LED Lights":29,"Elec. Water Heater":20,"A/C Tune-Up":3,"Heat Pump":15,"Wall Insul.":100,"Ceiling Insul.":100,"Radiant Barrier":25,"Cool Roof":30,"Window Replace":30,"Window Screen":20,"Ceiling Fan":11,"Washer Replace":14,"Cooktop Replace":13,"Dryer Replace":13,"Air Sealing":10,"Solar PV":25};
+const B=[
+  {p:0,t:"start",n:"START/FINISH",i:"🏠",c:0,s:0},{p:1,t:"weather",n:"Coldwave",i:"❄️",c:0,s:0},
+  {p:2,t:"retrofit",n:"Elec. Water Heater",i:"🚿",c:2100,s:1307},{p:3,t:"retrofit",n:"Cooktop Replace",i:"🍳",c:920,s:1743},
+  {p:4,t:"retrofit",n:"Ceiling Fan",i:"🌀",c:290,s:246},{p:5,t:"ob",n:"OB Card",i:"👤",c:0,s:0},
+  {p:6,t:"retrofit",n:"Window Screen",i:"🪟",c:1125,s:1108},{p:7,t:"retrofit",n:"Heat Pump",i:"♨️",c:3900,s:2534},
+  {p:8,t:"retrofit",n:"Radiant Barrier",i:"🛡️",c:812,s:819},{p:9,t:"ob",n:"OB Card",i:"👤",c:0,s:0},
+  {p:10,t:"retrofit",n:"Dryer Replace",i:"👕",c:760,s:963},{p:11,t:"retrofit",n:"Ceiling Insul.",i:"🏗️",c:6084,s:4343},
+  {p:12,t:"start",n:"START/FINISH",i:"📅",c:0,s:0},{p:13,t:"retrofit",n:"Air Sealing",i:"💨",c:57,s:553},
+  {p:14,t:"retrofit",n:"Washer Replace",i:"🫧",c:560,s:361},{p:15,t:"retrofit",n:"A/C Tune-Up",i:"🔧",c:200,s:677},
+  {p:16,t:"retrofit",n:"Window Replace",i:"🪟",c:3914,s:1755},{p:17,t:"ob",n:"OB Card",i:"👤",c:0,s:0},
+  {p:18,t:"retrofit",n:"Solar PV",i:"☀️",c:40984,s:29948},{p:19,t:"weather",n:"Heatwave",i:"🔥",c:0,s:0},
+  {p:20,t:"retrofit",n:"Cool Roof",i:"🏠",c:2078,s:945},{p:21,t:"ob",n:"OB Card",i:"👤",c:0,s:0},
+  {p:22,t:"retrofit",n:"Wall Insul.",i:"🧱",c:5076,s:3073},{p:23,t:"retrofit",n:"LED Lights",i:"💡",c:168,s:1584},
+];
+const OB_A=[{name:"Vacation",s:1000,d:"Vacation — systems shut off."},{name:"New Job (WFH)",s:-800,d:"WFH increases energy."},{name:"Long Party",s:-390,d:"Friends visit 10 days."},{name:"Energy Use Info",s:2880,d:"In-Home display helps."},{name:"Electric Car",s:-3000,d:"EV charging costs."}];
+const OB_C={"Elec. Water Heater":{w:[{name:"Water Temp ↓",s:511,d:"Lower temp."},{name:"Water Temp ↑",s:-511,d:"Higher temp."},{name:"Less Water",s:286,d:"Less water."},{name:"More Water",s:-351,d:"More water."}],wo:[{name:"Water Temp ↓",s:783,d:"Lower temp."},{name:"Water Temp ↑",s:-783,d:"Higher temp."},{name:"Less Water",s:438,d:"Less water."},{name:"More Water",s:-538,d:"More water."}]},"LED Lights":{w:[{name:"Lights Off",s:207,d:"Lights off when leaving."},{name:"Lights On",s:-328,d:"Lights left on."}],wo:[{name:"Lights Off",s:920,d:"Reduced hours."},{name:"Lights On",s:-1456,d:"All lights on."}]},"Heat Pump":{w:[{name:"A/C Use ↓",s:1253,d:"Fewer A/C hours."},{name:"Free Cooling",s:1156,d:"Economizer."},{name:"Thermostat ↓",s:549,d:"Lower thermostat."}],wo:[{name:"A/C Use ↓",s:695,d:"Reduced A/C."},{name:"Free Cooling",s:596,d:"Outdoor air."},{name:"Thermostat ↓",s:295,d:"Lower thermostat."}]}};
+const CL={sage:"#8DB580",sageDk:"#6B9C5E",cream:"#F5F0E8",creamDk:"#E8DCC8",brn:"#3B2F2F",brnLt:"#6B5B4B",gold:"#D4A843",goldBg:"#F2E6B5",red:"#C25450",redBg:"#EBBDB8",grn:"#4A8C3F",grnBg:"#B8D8AC",blu:"#5B8BA8",wht:"#FFFFFF",brd:"#7BAD6E",retBg:"#5A8A50"};
+
+/* Heuristic AI (fallback when no ONNX model) */
+function heuristicAI(st,sp){
+  if(sp.t!=="retrofit")return null;
+  const av=st.capital-st.utilBill-st.exp;
+  if(st.ar.some(r=>r.name===sp.n))return{rec:false,reason:"Already installed.",score:0,roi:"0",pb:"0",source:"heuristic"};
+  if(av<sp.c)return{rec:false,reason:"Insufficient budget.",score:0,roi:"0",pb:"0",source:"heuristic"};
+  const yl=SIM_YRS-st.year+1,life=Math.min(LIFE[sp.n]||10,yl);
+  const roi=(sp.s*RATE*life)/sp.c,pb=sp.c/(sp.s*RATE),eff=sp.s/sp.c;
+  let sc=Math.min(roi,5)*20+Math.min(eff,3)*15+(pb<yl?20:-10);
+  if(st.ts/BASE_E<.5)sc+=10;if(sp.c/av>.8)sc-=15;if(sp.c/av<.3)sc+=10;
+  const rec=sc>30;
+  const reason=rec?(roi>3?`Great ROI (${roi.toFixed(1)}x). Payback: ${pb.toFixed(1)} yrs.`:eff>1.5?`Efficiency: ${eff.toFixed(2)} kWh/$.`:`Positive return over ${life} yrs.`):(pb>yl?`Payback ${pb.toFixed(1)} yrs — only ${yl} left.`:sp.c/av>.8?"Too expensive.":"Low return.");
+  return{rec,reason,roi:roi.toFixed(2),pb:pb.toFixed(1),score:Math.round(sc),source:"heuristic"};
+}
+
+/* Combined AI: PPO + Heuristic */
+async function getAI(gameSt, sp) {
+  // Always compute heuristic
+  const heur = heuristicAI({capital:gameSt.capital,utilBill:utilB(gameSt),exp:gameSt.exp,year:gameSt.year,ar:gameSt.ar,ts:gameSt.ts}, sp);
+  
+  // Try PPO model
+  const ppo = await runPPO(gameSt, sp);
+  
+  if (ppo) {
+    // PPO model available — use it as primary, heuristic as supplement
+    const roi_val = ((sp.s * RATE * Math.min(LIFE[sp.n]||10, SIM_YRS-gameSt.year+1)) / sp.c);
+    const pb_val = sp.c / (sp.s * RATE);
+    return {
+      rec: ppo.rec,
+      pBuy: (ppo.pBuy * 100).toFixed(1),
+      pSkip: (ppo.pSkip * 100).toFixed(1),
+      confidence: (ppo.confidence * 100).toFixed(0),
+      reason: ppo.rec
+        ? `PPO model recommends BUY (${(ppo.pBuy*100).toFixed(0)}% confidence). ROI: ${roi_val.toFixed(1)}x`
+        : `PPO model recommends SKIP (${(ppo.pSkip*100).toFixed(0)}% confidence). ${heur?.reason || ""}`,
+      roi: roi_val.toFixed(2),
+      pb: pb_val.toFixed(1),
+      score: Math.round(ppo.pBuy * 100),
+      source: "ppo",
+      heuristic: heur,
+    };
+  }
+  
+  // Fallback to heuristic
+  return heur;
+}
+
+/* Portfolio & Utils */
+function calcPF(ar){const inv=ar.reduce((a,r)=>a+r.cost,0);const annD=ar.reduce((a,r)=>a+r.savings,0)*RATE;const rem=ar.reduce((a,r)=>a+r.savings*RATE*r.yr,0);const cum=ar.reduce((a,r)=>a+r.savings*RATE*Math.max(0,(LIFE[r.name]||10)-r.yr),0);return{inv,annD,rem,cum,net:cum-inv+rem};}
+function utilB(s){return Math.max(0,BASE_E-s.ts-s.obS-s.wS)*RATE;}
+function drawOB(ar){const pool=[...OB_A];for(const[n,c]of Object.entries(OB_C))pool.push(...(ar.some(r=>r.name===n)?c.w:c.wo));return pool[Math.floor(Math.random()*pool.length)];}
+async function sendToSheets(data){if(!GOOGLE_SHEETS_URL)return;try{await fetch(GOOGLE_SHEETS_URL,{method:"POST",mode:"no-cors",headers:{"Content-Type":"text/plain"},body:JSON.stringify(data)});}catch(e){}}
+
+/* Reducer */
+const INIT={phase:"consent",year:1,pos:0,capital:BASE_CAP,ts:0,ar:[],obS:0,wS:0,exp:0,dv:null,rolling:false,curSp:null,curOB:null,curW:null,ai:null,hist:[],log:[],dec:[],anim:false,name:"",tut:false,pid:"",sid:"",aiLoading:false};
+
+function red(st,a){
+  switch(a.type){
+    case "CONSENT":return{...st,phase:"menu",pid:a.id,sid:Date.now().toString(36)};
+    case "START":return{...INIT,phase:"playing",name:a.name||"Player",pid:st.pid,sid:Date.now().toString(36),log:["🏠 Game started! Roll the dice."+(onnxLoaded?" 🤖 PPO model active!":"")]};
+    case "TUT":return{...st,tut:!st.tut};
+    case "ROLL":return{...st,rolling:true,dv:null};
+    case "DICE":{
+      const d=a.value;let np=(st.pos+d)%24,ya=false;
+      for(let i=1;i<=d;i++){if((st.pos+i)%24===0&&st.pos!==0)ya=true;}
+      const sp=B[np];
+      if(ya&&st.year<SIM_YRS){
+        const ny=st.year+1;const upd=st.ar.map(r=>({...r,yr:r.yr-1})).filter(r=>r.yr>0);
+        const nts=upd.reduce((s,r)=>s+r.savings,0);const h={year:st.year,capital:st.capital,ts:st.ts,utilBill:utilB(st),exp:st.exp,cnt:st.ar.length};
+        if(ny>SIM_YRS)return{...st,rolling:false,dv:d,pos:np,phase:"over",hist:[...st.hist,h],log:[...st.log,`🎲 ${d}! Game Over!`]};
+        return{...st,rolling:false,dv:d,pos:np,year:ny,capital:BASE_CAP,exp:0,obS:0,wS:0,ts:nts,ar:upd,hist:[...st.hist,h],phase:"year_end",curSp:sp,log:[...st.log,`🎲 ${d}! Year ${ny} begins.`]};
+      }
+      let ph="playing",ob=null,wt=null;
+      const lg=[...st.log,`🎲 ${d} → ${sp.n}`];
+      if(sp.t==="retrofit"){
+        if(st.ar.some(r=>r.name===sp.n))lg.push(`✅ ${sp.n} — already installed.`);
+        else{ph="ai_loading";} // NEW: async AI loading phase
+      }else if(sp.t==="ob"){ph="ob";ob=drawOB(st.ar);lg.push(`👤 ${ob.name} (${ob.s>0?"+":""}${ob.s.toLocaleString()} kWh)`);}
+      else if(sp.t==="weather"){ph="weather";wt=sp.n;}
+      return{...st,rolling:false,dv:d,pos:np,phase:ph,curSp:sp,ai:null,curOB:ob,curW:wt,log:lg,anim:true,aiLoading:ph==="ai_loading"};
+    }
+    case "AI_READY":return{...st,phase:"decision",ai:a.ai,aiLoading:false};
+    case "ANIM":return{...st,anim:false};
+    case "BUY":{const s=st.curSp;const dec={year:st.year,pos:s.p,name:s.n,action:"buy",cost:s.c,savings:s.s,aiRec:st.ai?.rec,aiScore:st.ai?.score,aiSource:st.ai?.source,ts:Date.now()};return{...st,phase:"playing",exp:st.exp+s.c,ts:st.ts+s.s,ar:[...st.ar,{name:s.n,savings:s.s,cost:s.c,yr:LIFE[s.n]||10}],ai:null,curSp:null,dec:[...st.dec,dec],log:[...st.log,`🔧 ${s.n}! -$${s.c.toLocaleString()} +${s.s.toLocaleString()} kWh/yr`]};}
+    case "SKIP":{const dec={year:st.year,pos:st.curSp?.p,name:st.curSp?.n,action:"skip",cost:st.curSp?.c,savings:st.curSp?.s,aiRec:st.ai?.rec,aiScore:st.ai?.score,aiSource:st.ai?.source,ts:Date.now()};return{...st,phase:"playing",ai:null,curSp:null,dec:[...st.dec,dec],log:[...st.log,`⏭️ Skipped ${st.curSp?.n}.`]};}
+    case "DOB":return{...st,phase:"playing",curOB:null,obS:st.obS+(st.curOB?.s||0)};
+    case "DW":return{...st,phase:"playing",curW:null,wS:st.wS+(st.curW==="Coldwave"?-2000:-3000)};
+    case "DYE":{const s=st.curSp;if(s?.t==="retrofit"&&!st.ar.some(r=>r.name===s.n))return{...st,phase:"ai_loading",aiLoading:true};if(s?.t==="ob")return{...st,phase:"ob",curOB:drawOB(st.ar)};if(s?.t==="weather")return{...st,phase:"weather"};return{...st,phase:"playing"};}
+    case "RESET":return{...INIT,pid:st.pid,phase:"menu"};
+    default:return st;
+  }
+}
+
+/* ============================================================
+   COMPONENTS (Board, Dice, Stats, Portfolio, Log — same as before)
+   ============================================================ */
+function BoardCell({space,isP,owned,w,h}){const bg={start:`linear-gradient(145deg,${CL.gold},#C49A38)`,retrofit:owned?"linear-gradient(145deg,#3D6A35,#2D5A28)":`linear-gradient(145deg,${CL.retBg},#4D7D45)`,ob:"linear-gradient(145deg,#6B9C6B,#5A8A5A)",weather:space.n==="Coldwave"?"linear-gradient(145deg,#5B7D9C,#4A6C8A)":"linear-gradient(145deg,#B85042,#A04438)"}[space.t]||CL.retBg;return(<div style={{width:w,height:h,background:bg,borderRadius:5,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",position:"relative",padding:"2px 1px",overflow:"hidden",border:isP?`2.5px solid ${CL.gold}`:owned?`1.5px solid ${CL.goldBg}`:"1px solid rgba(0,0,0,0.12)",boxShadow:isP?`0 0 10px ${CL.gold}80`:"0 1px 2px rgba(0,0,0,0.08)",transition:"all .4s ease",transform:isP?"scale(1.05)":"scale(1)",flexShrink:0}}>{isP&&<div style={{position:"absolute",top:-4,right:-4,width:18,height:18,borderRadius:"50%",background:CL.gold,border:`1.5px solid ${CL.brn}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,zIndex:5,animation:"pp 2s ease-in-out infinite"}}>🧑</div>}{owned&&<div style={{position:"absolute",top:0,left:2,fontSize:7,color:CL.goldBg,fontWeight:800}}>✓</div>}<div style={{fontSize:13,lineHeight:1}}>{space.i}</div><div style={{fontSize:7,fontWeight:700,color:CL.wht,textAlign:"center",lineHeight:1.1,textShadow:"0 1px 1px rgba(0,0,0,.5)"}}>{space.n}</div>{space.t==="retrofit"&&<div style={{fontSize:6,color:CL.goldBg,marginTop:1,background:"rgba(0,0,0,.2)",borderRadius:2,padding:"0 3px",lineHeight:1.3}}>C:${space.c>=1000?(space.c/1000).toFixed(1)+"k":space.c} S:{space.s>=1000?(space.s/1000).toFixed(1)+"k":space.s}</div>}</div>);}
+
+function RectBoard({pos,ar}){const top=[0,1,2,3,4,5,6],right=[7,8,9,10,11],bottom=[18,17,16,15,14,13,12],left=[23,22,21,20,19];const cw=60,ch=50,gap=3,totalW=7*cw+6*gap,totalH=7*ch+6*gap;const mk=(idx,x,y)=>{const sp=B[idx];return(<div key={idx} style={{position:"absolute",left:x,top:y}}><BoardCell space={sp} isP={pos===idx} owned={ar.some(r=>r.name===sp.n)} w={cw} h={ch}/></div>);};const cells=[];top.forEach((idx,i)=>cells.push(mk(idx,i*(cw+gap),0)));right.forEach((idx,i)=>cells.push(mk(idx,6*(cw+gap),(i+1)*(ch+gap))));bottom.forEach((idx,i)=>cells.push(mk(idx,i*(cw+gap),6*(ch+gap))));left.forEach((idx,i)=>cells.push(mk(idx,0,(i+1)*(ch+gap))));return(<div style={{background:CL.brd,borderRadius:14,padding:10,border:`3px solid ${CL.sageDk}`,boxShadow:"0 4px 16px rgba(0,0,0,.15)",overflowX:"auto"}}><div style={{position:"relative",width:totalW,height:totalH,margin:"0 auto",minWidth:totalW}}>{cells}<div style={{position:"absolute",left:cw+gap,top:ch+gap,width:5*cw+4*gap,height:5*ch+4*gap,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",background:"rgba(255,255,255,.07)",borderRadius:10,border:"2px dashed rgba(255,255,255,.12)"}}><div style={{fontSize:28}}>🏠</div><div style={{fontSize:16,fontWeight:900,color:CL.wht,fontFamily:"Georgia,serif",textShadow:"0 2px 4px rgba(0,0,0,.3)"}}>NET-ZERO</div><div style={{fontSize:10,fontWeight:600,color:"rgba(255,255,255,.5)",fontFamily:"Georgia,serif",letterSpacing:3}}>HOME RACE</div></div></div></div>);}
+
+function Dice({value,rolling,onRoll,disabled}){const f=["⚀","⚁","⚂","⚃","⚄","⚅"];return(<button onClick={onRoll} disabled={disabled||rolling} style={{width:58,height:58,borderRadius:12,background:rolling?`linear-gradient(135deg,${CL.gold},#E8C050)`:CL.cream,border:`3px solid ${CL.brn}`,fontSize:32,display:"flex",alignItems:"center",justifyContent:"center",cursor:disabled?"not-allowed":"pointer",opacity:disabled?.5:1,animation:rolling?"ds .12s infinite":"none",color:CL.brn,transition:"all .3s",boxShadow:rolling?`0 0 14px ${CL.gold}60`:"0 3px 8px rgba(0,0,0,.2)"}}>{rolling?"🎲":value?f[value-1]:"🎲"}</button>);}
+
+function Stats({st}){const ubl=utilB(st),av=st.capital-ubl-st.exp;return(<div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:4,marginBottom:8}}>{[{l:"Year",v:`${st.year}/${SIM_YRS}`,i:"📅",c:CL.gold},{l:"Budget",v:`$${Math.max(0,av).toFixed(0)}`,i:"💰",c:av>2000?CL.grn:CL.red},{l:"Bill/yr",v:`$${ubl.toFixed(0)}`,i:"⚡",c:CL.red},{l:"Retrofits",v:`${st.ar.length}/16`,i:"🔧",c:CL.blu}].map(({l,v,i,c})=>(<div key={l} style={{background:CL.cream,borderRadius:8,padding:"4px 3px",textAlign:"center",border:`1px solid ${CL.creamDk}`}}><div style={{fontSize:12}}>{i}</div><div style={{fontSize:12,fontWeight:800,color:c,fontFamily:"Georgia,serif"}}>{v}</div><div style={{fontSize:7,color:CL.brnLt,fontWeight:600}}>{l}</div></div>))}</div>);}
+
+function Portfolio({ar}){const pf=calcPF(ar);const ne=Math.max(0,BASE_E-ar.reduce((a,r)=>a+r.savings,0));const pct=(1-ne/BASE_E)*100;return(<div style={{background:CL.cream,borderRadius:10,padding:"8px 10px",border:`1px solid ${CL.creamDk}`,marginBottom:8}}><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:5}}><span style={{fontSize:11,fontWeight:800,color:CL.brn,fontFamily:"Georgia,serif"}}>📊 PORTFOLIO</span><span style={{fontSize:12,fontWeight:800,color:pf.net>=0?CL.grn:CL.red,fontFamily:"Georgia,serif"}}>Net: ${pf.net.toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g,",")}</span></div><div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:4,marginBottom:5}}>{[{l:"Invested",v:`$${pf.inv.toLocaleString()}`,c:CL.red},{l:"Save/yr",v:`$${pf.annD.toFixed(0)}`,c:CL.grn},{l:"Cumulative",v:`$${pf.cum.toFixed(0)}`,c:CL.blu},{l:"Remaining",v:`$${pf.rem.toFixed(0)}`,c:CL.gold}].map(({l,v,c})=>(<div key={l} style={{textAlign:"center"}}><div style={{fontSize:11,fontWeight:700,color:c,fontFamily:"Georgia,serif"}}>{v}</div><div style={{fontSize:6.5,color:CL.brnLt,fontWeight:600}}>{l}</div></div>))}</div><div style={{height:8,background:CL.creamDk,borderRadius:6,overflow:"hidden"}}><div style={{height:"100%",borderRadius:6,width:`${Math.min(100,pct)}%`,background:pct>60?`linear-gradient(90deg,${CL.grn},#6BBF5A)`:pct>30?`linear-gradient(90deg,${CL.gold},#E8C050)`:`linear-gradient(90deg,${CL.red},#D06B68)`,transition:"width .8s ease"}}/></div><div style={{display:"flex",justifyContent:"space-between",marginTop:2}}><span style={{fontSize:7,color:CL.brnLt}}>0%</span><span style={{fontSize:8,fontWeight:700,color:pct>60?CL.grn:pct>30?CL.gold:CL.red}}>{pct.toFixed(1)}% Net-Zero</span><span style={{fontSize:7,color:CL.brnLt}}>100%</span></div></div>);}
+
+function Log({log}){const ref=useRef(null);useEffect(()=>{if(ref.current)ref.current.scrollTop=ref.current.scrollHeight;},[log]);return(<div ref={ref} style={{height:72,overflowY:"auto",background:CL.cream,borderRadius:8,padding:8,fontSize:11,color:CL.brn,border:`1px solid ${CL.creamDk}`}}>{log.map((e,i)=><div key={i} style={{padding:"2px 0",borderBottom:`1px solid ${CL.creamDk}`,animation:i===log.length-1?"su .3s ease":"none"}}>{e}</div>)}</div>);}
+
+/* ============================================================
+   MODALS
+   ============================================================ */
+const OV=({children})=>(<div style={{position:"fixed",inset:0,background:"rgba(59,47,47,.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:100,backdropFilter:"blur(4px)",animation:"fi .25s"}}>{children}</div>);
+const Card=({children,border,bg})=>(<div style={{background:bg||`linear-gradient(180deg,${CL.cream},${CL.creamDk})`,borderRadius:16,padding:22,maxWidth:400,width:"92%",border:`3px solid ${border||CL.sageDk}`,boxShadow:"0 16px 40px rgba(0,0,0,.25)",animation:"si .35s cubic-bezier(.34,1.56,.64,1)"}}>{children}</div>);
+
+/* UPDATED Decision Modal — shows PPO vs Heuristic */
+function DecisionModal({space,advice,onBuy,onSkip,ok}){
+  const isPPO = advice?.source === "ppo";
+  return(<OV><Card>
+    <div style={{textAlign:"center",marginBottom:12}}><span style={{fontSize:36}}>{space.i}</span><h2 style={{color:CL.brn,fontSize:18,fontWeight:800,fontFamily:"Georgia,serif"}}>{space.n}</h2></div>
+    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
+      <div style={{background:`${CL.red}15`,borderRadius:8,padding:8,textAlign:"center"}}><div style={{fontSize:9,color:CL.brnLt,fontWeight:600}}>COST</div><div style={{fontSize:18,fontWeight:800,color:CL.red,fontFamily:"Georgia,serif"}}>${space.c.toLocaleString()}</div></div>
+      <div style={{background:`${CL.grn}15`,borderRadius:8,padding:8,textAlign:"center"}}><div style={{fontSize:9,color:CL.brnLt,fontWeight:600}}>SAVINGS</div><div style={{fontSize:18,fontWeight:800,color:CL.grn,fontFamily:"Georgia,serif"}}>{space.s.toLocaleString()} kWh</div></div>
+    </div>
+    {/* AI Panel */}
+    {advice&&<div style={{background:advice.rec?CL.grnBg:CL.redBg,border:`2px solid ${advice.rec?CL.grn:CL.red}`,borderRadius:10,padding:"10px 12px",marginBottom:12}}>
+      <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:5}}>
+        <span style={{fontSize:18}}>🤖</span>
+        <b style={{fontSize:11,color:CL.brn}}>AI TEAMMATE</b>
+        {/* Source badge */}
+        <span style={{fontSize:8,padding:"1px 6px",borderRadius:10,background:isPPO?"#7C3AED":"#64748B",color:CL.wht,fontWeight:600,marginLeft:2}}>
+          {isPPO?"PPO MODEL":"HEURISTIC"}
+        </span>
+        <span style={{marginLeft:"auto",fontSize:10,padding:"2px 8px",borderRadius:20,fontWeight:700,background:advice.rec?CL.grn:CL.red,color:CL.wht}}>{advice.rec?"✓ BUY":"✗ SKIP"}</span>
+      </div>
+      <p style={{fontSize:12,color:CL.brn,lineHeight:1.4,margin:"0 0 5px"}}>{advice.reason}</p>
+      <div style={{display:"flex",gap:8,fontSize:10,color:CL.brnLt,flexWrap:"wrap"}}>
+        {isPPO&&<span>P(Buy): <b style={{color:CL.grn}}>{advice.pBuy}%</b></span>}
+        {isPPO&&<span>P(Skip): <b style={{color:CL.red}}>{advice.pSkip}%</b></span>}
+        <span>ROI: <b>{advice.roi}x</b></span>
+        <span>Payback: <b>{advice.pb}yr</b></span>
+        {!isPPO&&<span>Score: <b>{advice.score}</b></span>}
+      </div>
+    </div>}
+    <div style={{display:"flex",gap:8}}>
+      <button onClick={onSkip} style={{flex:1,padding:10,borderRadius:8,border:`2px solid ${CL.brnLt}30`,background:"transparent",color:CL.brnLt,fontWeight:700,fontSize:13,cursor:"pointer"}}>Skip</button>
+      <button onClick={onBuy} disabled={!ok} style={{flex:1,padding:10,borderRadius:8,border:"none",background:ok?`linear-gradient(135deg,${CL.grn},#3A7A30)`:"#aaa",color:CL.wht,fontWeight:800,fontSize:13,cursor:ok?"pointer":"not-allowed"}}>{ok?`Install ($${space.c.toLocaleString()})`:"Can't Afford"}</button>
+    </div>
+  </Card></OV>);
+}
+
+/* Loading Modal (while PPO model runs inference) */
+function AILoadingModal(){return(<OV><Card><div style={{textAlign:"center",padding:20}}><div style={{fontSize:36,marginBottom:8,animation:"ds 1s infinite"}}>🤖</div><div style={{color:CL.brn,fontSize:14,fontWeight:700,fontFamily:"Georgia,serif"}}>AI is thinking...</div><div style={{color:CL.brnLt,fontSize:11,marginTop:4}}>{onnxLoaded?"Running PPO neural network...":"Computing recommendation..."}</div></div></Card></OV>);}
+
+function OBModal({card,onDismiss}){const pos=card.s>=0;return(<OV><Card border={pos?CL.grn:CL.red} bg={pos?`linear-gradient(180deg,${CL.grnBg},${CL.cream})`:`linear-gradient(180deg,${CL.redBg},${CL.cream})`}><div style={{textAlign:"center"}}><div style={{width:32,height:32,borderRadius:"50%",background:pos?CL.grn:CL.red,display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 8px",fontSize:15,color:CL.wht}}>{pos?"➕":"➖"}</div><h2 style={{color:CL.brn,fontSize:17,marginBottom:4,fontFamily:"Georgia,serif"}}>{card.name}</h2><p style={{color:CL.brnLt,fontSize:12,marginBottom:12,lineHeight:1.4}}>{card.d}</p><div style={{fontSize:24,fontWeight:900,color:pos?CL.grn:CL.red,marginBottom:14,fontFamily:"Georgia,serif"}}>{pos?"+":""}{card.s.toLocaleString()} kWh</div><button onClick={onDismiss} style={{padding:"9px 30px",borderRadius:8,border:"none",background:pos?CL.grn:CL.red,color:CL.wht,fontWeight:700,cursor:"pointer",fontSize:13}}>Continue</button></div></Card></OV>);}
+function WModal({type,onDismiss}){const cold=type==="Coldwave";return(<OV><Card border={cold?"#5B7D9C":CL.red} bg={cold?"linear-gradient(180deg,#D0E0F0,#E8E0D8)":"linear-gradient(180deg,#F0C8C0,#E8E0D8)"}><div style={{textAlign:"center"}}><span style={{fontSize:48,display:"block",marginBottom:6}}>{cold?"❄️":"🔥"}</span><h2 style={{color:CL.brn,fontSize:20,marginBottom:4,fontFamily:"Georgia,serif"}}>{cold?"Coldwave!":"Heatwave!"}</h2><p style={{color:CL.brnLt,fontSize:12,marginBottom:12}}>{cold?"Extreme cold → heating up.":"Extreme heat → cooling up."}</p><div style={{fontSize:24,fontWeight:900,color:CL.red,marginBottom:14,fontFamily:"Georgia,serif"}}>{cold?"-2,000":"-3,000"} kWh</div><button onClick={onDismiss} style={{padding:"9px 30px",borderRadius:8,border:"none",background:cold?"#5B7D9C":CL.red,color:CL.wht,fontWeight:700,cursor:"pointer",fontSize:13}}>Continue</button></div></Card></OV>);}
+function YEModal({state,onCont}){const pf=calcPF(state.ar);const pct=((1-Math.max(0,BASE_E-state.ts-state.obS-state.wS)/BASE_E)*100).toFixed(1);return(<OV><Card border={CL.gold} bg={`linear-gradient(180deg,${CL.goldBg},${CL.cream})`}><div style={{textAlign:"center"}}><span style={{fontSize:36}}>📅</span><h2 style={{color:CL.brn,fontSize:20,fontFamily:"Georgia,serif"}}>Year {state.year}</h2><p style={{color:CL.brnLt,fontSize:12,marginBottom:10}}>Budget: ${BASE_CAP.toLocaleString()}</p><div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6,marginBottom:12}}>{[{l:"Retrofits",v:state.ar.length,c:CL.grn},{l:"Energy Cut",v:`${pct}%`,c:pct>50?CL.grn:CL.gold},{l:"Net Value",v:`$${pf.net.toFixed(0)}`,c:pf.net>=0?CL.grn:CL.red}].map(({l,v,c})=>(<div key={l} style={{background:"rgba(255,255,255,.5)",borderRadius:8,padding:6}}><div style={{fontSize:8,color:CL.brnLt,fontWeight:600}}>{l}</div><div style={{fontSize:15,fontWeight:800,color:c,fontFamily:"Georgia,serif"}}>{v}</div></div>))}</div><button onClick={onCont} style={{padding:"10px 30px",borderRadius:8,border:"none",background:`linear-gradient(135deg,${CL.gold},#C49A38)`,color:CL.wht,fontWeight:800,cursor:"pointer",fontSize:14}}>Continue</button></div></Card></OV>);}
+function Tut({onClose}){return(<OV><Card><div style={{maxHeight:"65vh",overflowY:"auto"}}><h2 style={{color:CL.brn,fontSize:18,marginBottom:12,fontFamily:"Georgia,serif"}}>🏠 How to Play</h2>{[{i:"🎲",t:"Roll & Move",d:"Roll dice around the rectangular board."},{i:"🔧",t:"Retrofits",d:"Buy upgrades. C=Cost, S=Savings (kWh/yr)."},{i:"🤖",t:"AI Teammate"+(onnxLoaded?" (PPO)":""),d:onnxLoaded?"Trained PPO neural network recommends BUY/SKIP with probability scores.":"AI recommends BUY/SKIP based on ROI & payback."},{i:"👤",t:"OB Cards",d:"Occupant behavior: ➕saves, ➖costs."},{i:"📊",t:"Portfolio",d:"Track investment value and net return."},{i:"🎯",t:"Goal",d:"20 yrs × $8,000/yr. Cut 48,000→0 kWh!"}].map(({i,t,d})=>(<div key={t} style={{display:"flex",gap:8,marginBottom:10}}><span style={{fontSize:18,flexShrink:0}}>{i}</span><div><div style={{color:CL.brn,fontWeight:700,fontSize:12,fontFamily:"Georgia,serif"}}>{t}</div><div style={{color:CL.brnLt,fontSize:11,lineHeight:1.4}}>{d}</div></div></div>))}</div><button onClick={onClose} style={{width:"100%",padding:10,borderRadius:8,border:"none",background:`linear-gradient(135deg,${CL.grn},#3A7A30)`,color:CL.wht,fontWeight:800,cursor:"pointer",fontSize:14,marginTop:6}}>Got it!</button></Card></OV>);}
+function Consent({onOk}){const[id,setId]=useState("");const[ok,setOk]=useState(false);return(<div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:`linear-gradient(180deg,${CL.sage},${CL.sageDk})`,padding:16}}><div style={{background:CL.cream,borderRadius:18,padding:24,maxWidth:440,width:"100%",border:`3px solid ${CL.sageDk}`,boxShadow:"0 8px 30px rgba(0,0,0,.2)",animation:"si .5s ease"}}><div style={{textAlign:"center",marginBottom:14}}><span style={{fontSize:40}}>🏠</span><h1 style={{color:CL.brn,fontSize:22,fontFamily:"Georgia,serif"}}>Net-Zero Home Race</h1><p style={{color:CL.brnLt,fontSize:11}}>Research Game</p></div><div style={{background:CL.creamDk,borderRadius:8,padding:12,marginBottom:14,fontSize:11,color:CL.brn,lineHeight:1.6}}><b>About:</b> This game simulates residential energy retrofit decisions over 20 years. Your gameplay data will be collected for academic research.<br/><br/><b>Data collected:</b> Participant ID, decisions, AI recommendations, outcomes. No personal info.<br/><br/><b>Participation is voluntary.</b></div><div style={{marginBottom:12}}><label style={{fontSize:12,color:CL.brn,fontWeight:600}}>Participant ID</label><input value={id} onChange={e=>setId(e.target.value)} placeholder="e.g., S001" style={{width:"100%",padding:"8px 10px",borderRadius:7,border:`2px solid ${CL.creamDk}`,background:CL.wht,color:CL.brn,fontSize:13,marginTop:4,boxSizing:"border-box",outline:"none"}}/></div><label style={{display:"flex",alignItems:"flex-start",gap:8,marginBottom:14,cursor:"pointer"}}><input type="checkbox" checked={ok} onChange={e=>setOk(e.target.checked)} style={{marginTop:2,accentColor:CL.grn}}/><span style={{fontSize:11,color:CL.brn,lineHeight:1.5}}>I consent to participate.</span></label><button onClick={()=>onOk(id.trim()||`P${Date.now().toString(36)}`)} disabled={!ok||!id.trim()} style={{width:"100%",padding:11,borderRadius:8,border:"none",background:ok&&id.trim()?`linear-gradient(135deg,${CL.grn},#3A7A30)`:"#bbb",color:CL.wht,fontWeight:800,fontSize:14,cursor:ok&&id.trim()?"pointer":"not-allowed"}}>Continue</button></div></div>);}
+
+function Results({state,onReset}){const fe=Math.max(0,BASE_E-state.ts),pct=(1-fe/BASE_E)*100,inv=state.hist.reduce((s,h)=>s+h.exp,0)+state.exp,g=pct>=90?"S":pct>=70?"A":pct>=50?"B":pct>=30?"C":"D",gc={S:CL.gold,A:CL.grn,B:CL.blu,C:"#D4A843",D:CL.red}[g],pf=calcPF(state.ar);const[sent,setSent]=useState(false);useEffect(()=>{const d={participantId:state.pid,sessionId:state.sid,playerName:state.name,timestamp:new Date().toISOString(),grade:g,energyReductionPct:pct.toFixed(1),totalInvested:inv,portfolioNetValue:pf.net.toFixed(0),totalRetrofits:state.ar.length,retrofitNames:state.ar.map(r=>r.name).join("; "),totalDecisions:state.dec.length,buyCount:state.dec.filter(d=>d.action==="buy").length,skipCount:state.dec.filter(d=>d.action==="skip").length,aiAgreement:state.dec.filter(d=>(d.action==="buy"&&d.aiRec)||(d.action==="skip"&&!d.aiRec)).length,ppoUsed:state.dec.some(d=>d.aiSource==="ppo"),decisionsJSON:JSON.stringify(state.dec),historyJSON:JSON.stringify(state.hist)};sendToSheets(d).then(()=>setSent(true));},[]);const exportJSON=()=>{const d={participantId:state.pid,sessionId:state.sid,playerName:state.name,exportTime:new Date().toISOString(),grade:g,energyPct:pct.toFixed(1),invested:inv,netValue:pf.net.toFixed(0),retrofits:state.ar,history:state.hist,decisions:state.dec};const b=new Blob([JSON.stringify(d,null,2)],{type:"application/json"});const u=URL.createObjectURL(b);const a=document.createElement("a");a.href=u;a.download=`NZHR_${state.pid}_${state.sid}.json`;a.click();};return(<div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:`linear-gradient(180deg,${CL.sage},${CL.sageDk})`,padding:16}}><div style={{maxWidth:460,width:"100%",animation:"si .5s ease"}}><div style={{background:CL.cream,borderRadius:18,padding:24,border:`3px solid ${CL.sageDk}`,textAlign:"center"}}><div style={{fontSize:56,fontWeight:900,color:gc,fontFamily:"Georgia,serif"}}>{g}</div><h1 style={{color:CL.brn,fontSize:22,fontFamily:"Georgia,serif"}}>Game Complete!</h1><p style={{color:CL.brnLt,fontSize:11,marginBottom:4}}>{state.name} ({state.pid})</p><div style={{background:`${CL.grn}12`,borderRadius:10,padding:10,marginBottom:14,border:`1px solid ${CL.grn}30`}}><div style={{fontSize:10,color:CL.brnLt,fontWeight:600}}>📊 FINAL PORTFOLIO</div><div style={{fontSize:26,fontWeight:900,color:pf.net>=0?CL.grn:CL.red,fontFamily:"Georgia,serif"}}>${pf.net.toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g,",")}</div></div><div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:14}}>{[{l:"Energy Cut",v:`${pct.toFixed(1)}%`,c:gc},{l:"Retrofits",v:state.ar.length,c:CL.grn},{l:"Invested",v:`$${inv.toLocaleString()}`,c:CL.red},{l:"Save $/yr",v:`$${(state.ts*RATE).toFixed(0)}`,c:CL.blu}].map(({l,v,c})=>(<div key={l} style={{background:CL.creamDk,borderRadius:8,padding:8}}><div style={{fontSize:8,color:CL.brnLt,fontWeight:600}}>{l}</div><div style={{fontSize:16,fontWeight:800,color:c,fontFamily:"Georgia,serif"}}>{v}</div></div>))}</div>{state.ar.length>0&&<div style={{background:CL.creamDk,borderRadius:8,padding:8,marginBottom:14,textAlign:"left"}}><div style={{fontSize:9,color:CL.brnLt,fontWeight:700,marginBottom:3}}>INSTALLED</div><div style={{display:"flex",flexWrap:"wrap",gap:3}}>{state.ar.map(r=><span key={r.name} style={{fontSize:9,padding:"2px 6px",borderRadius:10,background:`${CL.grn}20`,color:CL.grn,fontWeight:600}}>{r.name}</span>)}</div></div>}<div style={{display:"flex",gap:8}}><button onClick={exportJSON} style={{flex:1,padding:10,borderRadius:8,border:`2px solid ${CL.sageDk}`,background:"transparent",color:CL.sageDk,fontWeight:700,cursor:"pointer",fontSize:12}}>📥 Export</button><button onClick={onReset} style={{flex:1,padding:10,borderRadius:8,border:"none",background:`linear-gradient(135deg,${CL.grn},#3A7A30)`,color:CL.wht,fontWeight:800,cursor:"pointer",fontSize:12}}>Play Again</button></div><p style={{fontSize:8,color:CL.brnLt,marginTop:6}}>{sent?"✅ Saved":"⏳ Saving..."} | {state.sid}</p></div></div></div>);}
+
+function Menu({onStart,onTut,pid}){const[n,setN]=useState("");return(<div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:`linear-gradient(180deg,${CL.sage},${CL.sageDk},#5A8A4E)`,padding:16,position:"relative",overflow:"hidden"}}><div style={{position:"absolute",inset:0,pointerEvents:"none"}}>{["🏠","⚡","🔧","💡","☀️","🌿"].map((e,i)=><div key={i} style={{position:"absolute",fontSize:18+Math.random()*14,opacity:.1,left:`${10+Math.random()*80}%`,top:`${10+Math.random()*80}%`,animation:`fl ${7+Math.random()*5}s ease-in-out infinite`,animationDelay:`${Math.random()*3}s`}}>{e}</div>)}</div><div style={{textAlign:"center",zIndex:1,animation:"si .6s ease"}}><div style={{background:CL.cream,borderRadius:22,padding:"28px 32px",maxWidth:360,width:"100%",border:`3px solid ${CL.sageDk}`,boxShadow:"0 10px 30px rgba(0,0,0,.2)"}}><div style={{fontSize:44,marginBottom:4}}>🏠</div><h1 style={{fontSize:24,fontWeight:900,color:CL.brn,fontFamily:"Georgia,serif",lineHeight:1.2,marginBottom:2}}>NET-ZERO<br/>HOME RACE</h1><p style={{color:CL.brnLt,fontSize:11,marginBottom:2}}>Participant: <b>{pid}</b></p>{onnxLoaded&&<p style={{fontSize:10,color:"#7C3AED",fontWeight:700,marginBottom:4}}>🤖 PPO Neural Network Active</p>}<p style={{color:CL.brnLt,fontSize:11,marginBottom:16}}>Retrofit your home over 20 years!</p><input value={n} onChange={e=>setN(e.target.value)} placeholder="Your name..." style={{width:"100%",padding:"8px 12px",borderRadius:8,boxSizing:"border-box",border:`2px solid ${CL.creamDk}`,background:CL.wht,color:CL.brn,fontSize:14,textAlign:"center",outline:"none",fontFamily:"Georgia,serif"}} onKeyDown={e=>{if(e.key==="Enter")onStart(n.trim()||"Player");}}/><div style={{display:"flex",gap:8,marginTop:12}}><button onClick={onTut} style={{flex:1,padding:10,borderRadius:8,border:`2px solid ${CL.sageDk}`,background:"transparent",color:CL.sageDk,fontWeight:700,cursor:"pointer",fontSize:12}}>How to Play</button><button onClick={()=>onStart(n.trim()||"Player")} style={{flex:1.3,padding:10,borderRadius:8,border:"none",background:`linear-gradient(135deg,${CL.grn},#3A7A30)`,color:CL.wht,fontWeight:800,fontSize:14,cursor:"pointer"}}>Start Game</button></div></div></div></div>);}
+
+/* ============================================================
+   MAIN APP — with async AI inference
+   ============================================================ */
+function App(){
+  const[st,dp]=useReducer(red,INIT);
+  
+  // Async AI inference when entering ai_loading phase
+  useEffect(()=>{
+    if(st.phase==="ai_loading"&&st.curSp){
+      getAI(st,st.curSp).then(ai=>{
+        dp({type:"AI_READY",ai});
+      });
+    }
+  },[st.phase,st.curSp]);
+  
+  const roll=useCallback(()=>{dp({type:"ROLL"});setTimeout(()=>{dp({type:"DICE",value:Math.floor(Math.random()*6)+1});setTimeout(()=>dp({type:"ANIM"}),400);},600);},[]);
+  
+  if(st.phase==="consent")return <Consent onOk={id=>dp({type:"CONSENT",id})}/>;
+  if(st.phase==="over")return <Results state={st} onReset={()=>dp({type:"RESET"})}/>;
+  if(st.phase==="menu")return(<React.Fragment><Menu onStart={n=>dp({type:"START",name:n})} onTut={()=>dp({type:"TUT"})} pid={st.pid}/>{st.tut&&<Tut onClose={()=>dp({type:"TUT"})}/>}</React.Fragment>);
+  
+  const can=st.phase==="playing"&&!st.rolling&&!st.anim;
+  const av=st.capital-utilB(st)-st.exp;
+  
+  return(<div style={{minHeight:"100vh",background:`linear-gradient(180deg,${CL.sage},${CL.sageDk})`,fontFamily:"'Segoe UI',system-ui,sans-serif"}}>
+    <div style={{padding:"8px 12px",display:"flex",alignItems:"center",justifyContent:"space-between",background:"rgba(0,0,0,.08)",borderBottom:"1px solid rgba(0,0,0,.06)"}}>
+      <span style={{fontWeight:800,fontSize:12,color:CL.wht,fontFamily:"Georgia,serif"}}>🏠 NZHR</span>
+      <span style={{fontSize:10,color:"rgba(255,255,255,.7)"}}>{st.name} ({st.pid}) · Yr {st.year} {onnxLoaded?"🤖":""}</span>
+      <button onClick={()=>dp({type:"TUT"})} style={{background:"rgba(255,255,255,.15)",border:"none",color:CL.wht,padding:"3px 10px",borderRadius:5,cursor:"pointer",fontSize:11}}>?</button>
+    </div>
+    <div style={{maxWidth:480,margin:"0 auto",padding:"8px 8px 60px"}}>
+      <Stats st={st}/>
+      <Portfolio ar={st.ar}/>
+      <div style={{marginBottom:8,overflowX:"auto"}}><RectBoard pos={st.pos} ar={st.ar}/></div>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:12,marginBottom:8}}>
+        <Dice value={st.dv} rolling={st.rolling} onRoll={roll} disabled={!can}/>
+        <div><div style={{fontSize:12,color:CL.cream,fontWeight:600}}>{can?"🎲 Tap to roll!":st.rolling?"Rolling...":"Waiting..."}</div><div style={{fontSize:10,color:"rgba(255,255,255,.4)"}}>Pos {st.pos}: {B[st.pos]?.n}</div></div>
+      </div>
+      <Log log={st.log}/>
+    </div>
+    {st.phase==="ai_loading"&&<AILoadingModal/>}
+    {st.phase==="decision"&&st.curSp&&<DecisionModal space={st.curSp} advice={st.ai} ok={av>=st.curSp.c} onBuy={()=>dp({type:"BUY"})} onSkip={()=>dp({type:"SKIP"})}/>}
+    {st.phase==="ob"&&st.curOB&&<OBModal card={st.curOB} onDismiss={()=>dp({type:"DOB"})}/>}
+    {st.phase==="weather"&&st.curW&&<WModal type={st.curW} onDismiss={()=>dp({type:"DW"})}/>}
+    {st.phase==="year_end"&&<YEModal state={st} onCont={()=>dp({type:"DYE"})}/>}
+    {st.tut&&<Tut onClose={()=>dp({type:"TUT"})}/>}
+  </div>);
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
