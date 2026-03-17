@@ -85,7 +85,7 @@ case "BUY":{const s=st.curSp;const dec={year:st.year,pos:s.p,name:s.n,action:"bu
 case "SKIP":{const sn=st.curSp?st.curSp.n:"";const dec2={year:st.year,pos:st.curSp?st.curSp.p:0,name:sn,action:"skip",cost:st.curSp?st.curSp.c:0,savings:st.curSp?st.curSp.s:0,aiRec:st.ai?st.ai.rec:null,aiScore:st.ai?st.ai.score:null,aiConsulted:a.consulted||false,cardStage:st.cardStage,ts:Date.now()};return{...st,phase:"playing",ai:null,curSp:null,dec:[...st.dec,dec2],log:[...st.log,"⏭️ Skip "+sn+(a.consulted?" (AI)":"")],cardStage:"back"}}
 case "DOB":return{...st,phase:"playing",curOB:null,obS:st.obS+(st.curOB?st.curOB.s:0)};
 case "DW":return{...st,phase:"playing",curW:null,wS:st.wS+(st.curW==="Coldwave"?-2000:-3000),yearWeather:st.curW?st.curW.toLowerCase():null};
-case "DYE":{const s3=st.curSp;if(s3&&s3.t==="retrofit"&&!st.ar.some(function(r){return r.name===s3.n}))return{...st,phase:"retrofit_choice",cardStage:"back",ai:null};if(s3&&s3.t==="ob")return{...st,phase:"ob",curOB:drawOB(st.ar)};if(s3&&s3.t==="weather")return{...st,phase:"weather"};return{...st,phase:"playing"}}
+case "DYE":{const s3=st.curSp;if(s3&&s3.t==="retrofit"&&!st.ar.some(function(r){return r.name===s3.n}))return{...st,phase:"retrofit_choice",cardStage:"back",ai:null};if(s3&&s3.t==="ob")return{...st,phase:"ob",curOB:drawOB(st.ar)};if(s3&&s3.t==="weather")return{...st,phase:"weather",curW:s3.n};return{...st,phase:"playing"}}
 case "RESET":return{...INIT,pid:st.pid,phase:"menu"};
 default:return st}}
 
@@ -121,7 +121,7 @@ function Menu({onStart,onTut}){const[n,setN]=React.useState("");return(<div styl
 
 function App(){const[st,dp]=React.useReducer(red,INIT);const animRef=React.useRef(null);const roll=React.useCallback(function(){dp({type:"ROLL"});const v1=Math.floor(Math.random()*6)+1;const v2=Math.floor(Math.random()*6)+1;setTimeout(function(){dp({type:"DICE_SHOW",d1:v1,d2:v2});setTimeout(function(){dp({type:"START_MOVE"})},1000)},1200)},[]);
 React.useEffect(function(){if(st.animating&&st.animPos!==st.animTarget){animRef.current=setTimeout(function(){dp({type:"ANIM_STEP"})},500);return function(){clearTimeout(animRef.current)}}else if(st.animating&&st.animPos===st.animTarget){setTimeout(function(){dp({type:"ANIM_DONE"})},600)}},[st.animating,st.animPos,st.animTarget]);
-React.useEffect(function(){if(st.phase==="ep_loading"){var names=st.ar.map(function(r){return r.name});var weather=st.yearWeather||"normal";if(EP_API_URL){callEPAPI(names,weather).then(function(result){dp({type:"EP_DONE",result:result})}).catch(function(){dp({type:"EP_DONE",result:null})});setTimeout(function(){dp({type:"EP_DONE",result:null})},40000)}else{setTimeout(function(){dp({type:"EP_DONE",result:null})},2000)}}},[st.phase]);
+React.useEffect(function(){if(st.phase==="ep_loading"){var names=st.ar.map(function(r){return r.name});var weather=st.yearWeather||"normal";if(EP_API_URL){callEPAPI(names,weather).then(function(result){dp({type:"EP_DONE",result:result})}).catch(function(){dp({type:"EP_DONE",result:null})})}else{setTimeout(function(){dp({type:"EP_DONE",result:null})},2000)}}},[st.phase]);
 const handleAskAI=React.useCallback(async function(){let ppoResult=null;if(ppoLoaded){ppoResult=await ppoPredict({year:st.year,pos:st.pos,capital:st.capital,ts:st.ts,ar:st.ar},st.curSp)}dp({type:"ASK_AI",ppoResult:ppoResult})},[st.year,st.pos,st.capital,st.ts,st.ar,st.curSp]);
 
 if(st.phase==="over")return <Results state={st} onReset={function(){dp({type:"RESET"})}}/>;
