@@ -170,8 +170,8 @@ function doYearAdvance(st, ny, sp, lg) {
 
 function red(st, a) {
   switch (a.type) {
-    case "CONSENT": return { ...st, phase: "menu", pid: a.id, sid: Date.now().toString(36) };
-    case "START": return { ...INIT, phase: "playing", name: a.name || "Player", pid: st.pid, sid: Date.now().toString(36), log: ["🏠 Game started! Roll the dice."] };
+    case "CONSENT": return st;
+    case "START": return { ...INIT, phase: "playing", name: a.name || "Player", pid: "Session_" + Date.now().toString(36), sid: Date.now().toString(36), log: ["🏠 Game started! Roll the dice."] };
     case "TUT": return { ...st, tut: !st.tut };
     case "SEL_RETRO": return { ...st, selRetrofit: st.selRetrofit === a.name ? null : a.name };
     case "ROLL": return { ...st, rolling: true, dv: null, d1: null, d2: null, diceAnim: true, diceShowResult: false, selRetrofit: null };
