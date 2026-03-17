@@ -32,7 +32,7 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;overflow-x:hidden
 <div id="root"></div>
 <script type="text/babel">
 const EP_API_URL = "https://unrecluse-natacha-subvitreous.ngrok-free.dev";
-const GOOGLE_SHEETS_URL = "";
+const GOOGLE_SHEETS_URL = "https://script.google.com/macros/s/AKfycbz3NjEcjV4FejsAL0VAqhPcpEp3why4PE4z1N89qHttFY-C9uMb5pMy9q1e92GQHT_LFw/exec";
 const ONNX_MODEL_PATH = "nzhr_policy.onnx";
 
 const SIM_YRS=20, BASE_CAP=8000, BASE_E=45349, RATE=0.12;
@@ -84,7 +84,7 @@ case "ASK_AI":{const ai2=heuristicAI({capital:st.capital,utilBill:utilB(st),exp:
 case "BUY":{const s=st.curSp;const dec={year:st.year,pos:s.p,name:s.n,action:"buy",cost:s.c,savings:s.s,aiRec:st.ai?st.ai.rec:null,aiScore:st.ai?st.ai.score:null,aiConsulted:a.consulted||false,cardStage:st.cardStage,ts:Date.now()};return{...st,phase:"playing",exp:st.exp+s.c,ts:st.ts+s.s,ar:[...st.ar,{name:s.n,savings:s.s,cost:s.c,yr:LIFE[s.n]||10}],ai:null,curSp:null,dec:[...st.dec,dec],log:[...st.log,"🔧 "+s.n+"! -$"+s.c.toLocaleString()+" +"+(s.s/1000).toFixed(1)+"k kWh/yr"+(a.consulted?" (AI)":"")],cardStage:"back"}}
 case "SKIP":{const sn=st.curSp?st.curSp.n:"";const dec2={year:st.year,pos:st.curSp?st.curSp.p:0,name:sn,action:"skip",cost:st.curSp?st.curSp.c:0,savings:st.curSp?st.curSp.s:0,aiRec:st.ai?st.ai.rec:null,aiScore:st.ai?st.ai.score:null,aiConsulted:a.consulted||false,cardStage:st.cardStage,ts:Date.now()};return{...st,phase:"playing",ai:null,curSp:null,dec:[...st.dec,dec2],log:[...st.log,"⏭️ Skip "+sn+(a.consulted?" (AI)":"")],cardStage:"back"}}
 case "DOB":return{...st,phase:"playing",curOB:null,obS:st.obS+(st.curOB?st.curOB.s:0)};
-case "DW":return{...st,phase:"playing",curW:null,wS:st.wS+(st.curW==="Coldwave"?-2000:-3000),yearWeather:st.curW?st.curW.toLowerCase():null};
+case "DW":return{...st,phase:"playing",curW:null,wS:st.wS,yearWeather:st.curW?st.curW.toLowerCase():null};
 case "DYE":{const s3=st.curSp;if(s3&&s3.t==="retrofit"&&!st.ar.some(function(r){return r.name===s3.n}))return{...st,phase:"retrofit_choice",cardStage:"back",ai:null};if(s3&&s3.t==="ob")return{...st,phase:"ob",curOB:drawOB(st.ar)};if(s3&&s3.t==="weather")return{...st,phase:"weather",curW:s3.n};return{...st,phase:"playing"}}
 case "RESET":return{...INIT,pid:st.pid,phase:"menu"};
 default:return st}}
