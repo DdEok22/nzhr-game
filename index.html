@@ -158,7 +158,7 @@ function calcPF(ar) { const inv = ar.reduce(function(a, r) { return a + r.cost }
 function utilB(s) { return Math.max(0, BASE_E - s.ts - s.obS - s.wS) * RATE; }
 function drawOB(ar) { const pool = [...OB_A]; for (const k of Object.keys(OB_C)) { const c = OB_C[k]; pool.push(...(ar.some(function(r) { return r.name === k }) ? c.w : c.wo)); } return pool[Math.floor(Math.random() * pool.length)]; }
 
-const INIT = { phase: "consent", year: 1, pos: 0, capital: BASE_CAP, ts: 0, ar: [], obS: 0, wS: 0, exp: 0, dv: null, d1: null, d2: null, rolling: false, curSp: null, curOB: null, curW: null, ai: null, hist: [], log: [], dec: [], name: "", tut: false, pid: "", sid: "", animPos: 0, animTarget: 0, animating: false, diceAnim: false, diceShowResult: false, cardStage: "back", selRetrofit: null, epLoading: false, epResult: null };
+const INIT = { phase: "menu", year: 1, pos: 0, capital: BASE_CAP, ts: 0, ar: [], obS: 0, wS: 0, exp: 0, dv: null, d1: null, d2: null, rolling: false, curSp: null, curOB: null, curW: null, ai: null, hist: [], log: [], dec: [], name: "", tut: false, pid: "", sid: "", animPos: 0, animTarget: 0, animating: false, diceAnim: false, diceShowResult: false, cardStage: "back", selRetrofit: null, epLoading: false, epResult: null };
 
 function doYearAdvance(st, ny, sp, lg) {
   const upd = st.ar.map(function(r) { return { ...r, yr: r.yr - 1 } }).filter(function(r) { return r.yr > 0 });
