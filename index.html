@@ -32,7 +32,7 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;overflow-x:hidden
 <div id="root"></div>
 <script type="text/babel">
 const EP_API_URL = "https://unrecluse-natacha-subvitreous.ngrok-free.dev";
-const GOOGLE_SHEETS_URL = "https://script.google.com/macros/s/AKfycbzzaCls65tY4AHlYUK9S0BqQLz1Qu-dhnyHztiuRIClOzsua6mK-lY05ZpePskxyZ0PQg/exec";
+const GOOGLE_SHEETS_URL = "https://script.google.com/macros/s/AKfycbxnEs7xrWhjgK29RCNVd1p1qYtaLsaBLnZ4gB6ezFvY9QdD6IEzMIbciufv8fWHnW99Cw/exec";
 const ONNX_MODEL_PATH = "nzhr_policy.onnx";
 
 const SIM_YRS=20, BASE_CAP=8000, BASE_E=45349, RATE=0.12;
@@ -87,9 +87,10 @@ case "DOB":return{...st,phase:"playing",curOB:null,obS:st.obS+(st.curOB?st.curOB
 case "DW":return{...st,phase:"playing",curW:null,wS:st.wS,yearWeather:st.curW?st.curW.toLowerCase():null};
 case "DYE":{const s3=st.curSp;if(s3&&s3.t==="retrofit"&&!st.ar.some(function(r){return r.name===s3.n}))return{...st,phase:"retrofit_choice",cardStage:"back",ai:null};if(s3&&s3.t==="ob")return{...st,phase:"ob",curOB:drawOB(st.ar)};if(s3&&s3.t==="weather")return{...st,phase:"weather",curW:s3.n};return{...st,phase:"playing"}}
 case "RESET":return{...INIT,pid:st.pid,phase:"menu"};
-default:return st}}case "PRE_DONE":return{...st,phase:"playing",surveyPre:a.data,studentId:a.data.studentId||"",age:a.data.age||"",major:a.data.major||""};
+case "PRE_DONE":return{...st,phase:"playing",surveyPre:a.data,studentId:a.data.studentId||"",age:a.data.age||"",major:a.data.major||""};
 case "POST_DONE":return{...st,phase:"over",surveyPost:a.data};
 case "SET_RANK":return{...st,ranking:a.ranking};
+default:return st}}
 
 function getBoardPositions(){const top=[0,1,2,3,4,5,6],right=[7,8,9,10,11],bottom=[18,17,16,15,14,13,12],left=[23,22,21,20,19];var cw=62,ch=54,gap=3;const positions={};top.forEach(function(idx,i){positions[idx]={x:i*(cw+gap),y:0,w:cw,h:ch}});right.forEach(function(idx,i){positions[idx]={x:6*(cw+gap),y:(i+1)*(ch+gap),w:cw,h:ch}});bottom.forEach(function(idx,i){positions[idx]={x:i*(cw+gap),y:6*(ch+gap),w:cw,h:ch}});left.forEach(function(idx,i){positions[idx]={x:0,y:(i+1)*(ch+gap),w:cw,h:ch}});return{positions:positions,totalW:7*cw+6*gap,totalH:7*ch+6*gap,cw:cw,ch:ch,gap:gap}}
 
